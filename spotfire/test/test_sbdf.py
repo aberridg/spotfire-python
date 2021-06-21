@@ -3,6 +3,7 @@
 import datetime
 import decimal
 import os
+import typing
 import unittest
 
 import pandas
@@ -111,3 +112,183 @@ class SbdfTest(unittest.TestCase):
         self.assertTrue(pandas.isnull(dataframe.at[10000, "TimeSpan"]))
         self.assertEqual(dataframe.at[10000, "String"], "kiwis")
         self.assertEqual(dataframe.at[10000, "Binary"], b"\x7c\x7d\x7e\x7f")
+
+    def test_get_spotfire_types(self):
+        """All types should be reported properly"""
+        dataframe = sbdf.import_data("%s/files/sbdf/alltypes.sbdf" % os.path.dirname(__file__))
+        type_names = sbdf.get_spotfire_types(dataframe)
+        self.assertEqual(type_names["ColumnBoolean"], "Boolean")
+        self.assertEqual(type_names["ColumnDate"], "Date")
+        self.assertEqual(type_names["ColumnDateTime"], "DateTime")
+        self.assertEqual(type_names["ColumnDecimal"], "Currency")
+        self.assertEqual(type_names["ColumnDouble"], "Real")
+        self.assertEqual(type_names["ColumnFloat"], "SingleReal")
+        self.assertEqual(type_names["ColumnInteger"], "Integer")
+        self.assertEqual(type_names["ColumnLong"], "LongInteger")
+        self.assertEqual(type_names["ColumnString"], "String")
+        self.assertEqual(type_names["ColumnTime"], "Time")
+        self.assertEqual(type_names["ColumnTimeSpan"], "TimeSpan")
+        self.assertEqual(type_names["ColumnCMTNA"], "Integer")
+
+    def test_set_spotfire_types(self):
+        """Setting SBDF types should work properly"""
+        dataframe = sbdf.import_data("%s/files/sbdf/alltypes.sbdf" % os.path.dirname(__file__))
+        # set a single column by name
+        sbdf.set_spotfire_types(dataframe, {"ColumnLong": "Integer"})
+        self.assertEqual(sbdf.get_spotfire_types(dataframe)["ColumnLong"], "Integer")
+
+        # set multiple columns by name
+        sbdf.set_spotfire_types(dataframe, {"ColumnString": "Boolean", "ColumnTime": "Date"})
+        self.assertEqual(sbdf.get_spotfire_types(dataframe)["ColumnString"], "Boolean")
+        self.assertEqual(sbdf.get_spotfire_types(dataframe)["ColumnTime"], "Date")
+
+        # set invalid column name
+        with self.assertWarnsRegex(Warning, "Column 'BadColumnName' not found in data"):
+            sbdf.set_spotfire_types(dataframe, {"BadColumnName": "Integer"})
+
+        # set invalid column type
+        with self.assertWarnsRegex(Warning, "Spotfire type 'BadType' not recognized"):
+            sbdf.set_spotfire_types(dataframe, {"ColumnLong": "BadType"})
+
+        # one invalid column name, other changes should be committed
+        types = sbdf.get_spotfire_types(dataframe)
+        self.assertEqual(types["ColumnString"], "Boolean")
+        self.assertEqual(types["ColumnDate"], "Date")
+        with self.assertWarnsRegex(Warning, "Column 'BadColumnName' not found in data"):
+            sbdf.set_spotfire_types(dataframe, {"ColumnString": "Integer", "BadColumnName": "Integer",
+                                                "ColumnDate": "DateTime"})
+        types = sbdf.get_spotfire_types(dataframe)
+        self.assertEqual(types["ColumnString"], "Integer")
+        self.assertEqual(types["ColumnDate"], "DateTime")
+
+        # one invalid column type, other changes should be committed
+        types = sbdf.get_spotfire_types(dataframe)
+        self.assertEqual(types["ColumnString"], "Integer")
+        self.assertEqual(types["ColumnLong"], "Integer")
+        self.assertEqual(types["ColumnInteger"], "Integer")
+        with self.assertWarnsRegex(Warning, "Spotfire type 'BadType' not recognized"):
+            sbdf.set_spotfire_types(dataframe, {"ColumnString": "String", "ColumnLong": "BadType",
+                                                "ColumnInteger": "LongInteger"})
+        types = sbdf.get_spotfire_types(dataframe)
+        self.assertEqual(types["ColumnString"], "String")
+        self.assertEqual(types["ColumnLong"], "Integer")
+        self.assertEqual(types["ColumnInteger"], "LongInteger")
+
+    def test_import_export_alltypes(self):
+        """Verify all types properly export and re-import with the proper Spotfire type"""
+        dataframe = sbdf.import_data("%s/files/sbdf/alltypes.sbdf" % os.path.dirname(__file__))
+        sbdf.export_data(dataframe, "output.sbdf")
+        newdf = sbdf.import_data("output.sbdf")
+        self.assertTrue(dataframe.equals(newdf))
+        self.assertTrue(sbdf.get_spotfire_types(dataframe).equals(sbdf.get_spotfire_types(newdf)))
+
+    def test_invalid_export_type(self):
+        """Verify invalid export types are ignored"""
+        dataframe = pandas.DataFrame({"x": [1, 2, 3]})
+
+        # setting invalid type via function should fail
+        with self.assertWarnsRegex(Warning, "Spotfire type 'Unknown' not recognized"):
+            sbdf.set_spotfire_types(dataframe, {"x": "Unknown"})
+
+        # force set it and see expect it to be ignored
+        dataframe["x"].attrs["spotfire_type"] = "Unknown"
+        _, newdf_types = self.roundtrip_dataframe(dataframe)
+        self.assertEqual(newdf_types["x"], "LongInteger")
+
+    def test_import_export_string(self):
+        """Verify string column conversions"""
+        data = ["apple", "banana", "cherry"]
+        default_type = "String"
+        pass_types = ["String", "Boolean"]
+        fail_types = ["DateTime", "Date", "Time", "TimeSpan", "Currency",
+                      "Integer", "LongInteger", "SingleReal", "Real", "Binary"]
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def test_import_export_integer(self):
+        """Verify integer column conversions"""
+        data = [1, 2, 3]
+        default_type = "LongInteger"
+        pass_types = ["String", "Boolean", "Integer", "LongInteger", "SingleReal", "Real"]
+        fail_types = ["DateTime", "Date", "Time", "TimeSpan", "Binary", "Currency"]
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def test_import_export_datetime(self):
+        """Verify datetime column conversions"""
+        data = [datetime.datetime.now(), datetime.datetime(1979, 10, 23, 5, 32, 00)]
+        default_type = "DateTime"
+        pass_types = ["String", "DateTime", "Boolean"]
+        fail_types = ["Binary", "Currency", "Date", "Time", "TimeSpan", "Integer", "LongInteger", "SingleReal", "Real"]
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def test_import_export_date(self):
+        """Verify date column conversions"""
+        data = [datetime.datetime.now().date(), datetime.datetime(1979, 10, 23, 5, 32, 00).date()]
+        default_type = "Date"
+        pass_types = ["String", "Date", "Boolean"]
+        fail_types = ["Binary", "Currency", "DateTime", "Time", "TimeSpan", "Integer",
+                      "LongInteger", "SingleReal", "Real"]
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def test_import_export_time(self):
+        """Verify time column conversions"""
+        data = [datetime.datetime.now().time(), datetime.datetime(1979, 10, 23, 5, 32, 00).time()]
+        default_type = "Time"
+        pass_types = ["String", "Time", "Boolean"]
+        fail_types = ["Binary", "Currency", "DateTime", "Date", "TimeSpan", "Integer",
+                      "LongInteger", "SingleReal", "Real"]
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def test_import_export_timespan(self):
+        """Verify time column conversions"""
+        data = [datetime.timedelta(milliseconds=12345678900), datetime.timedelta(milliseconds=98765432100)]
+        default_type = "TimeSpan"
+        pass_types = ["String", "TimeSpan", "Boolean"]
+        fail_types = ["Binary", "Currency", "DateTime", "Date", "Time", "Integer", "LongInteger", "SingleReal", "Real"]
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def test_import_export_missing(self):
+        """Verify column with all missing values can be coerced to anything"""
+        data = [None, None, None]
+        default_type = None
+        pass_types = ["String", "DateTime", "Date", "Time", "TimeSpan", "Binary", "Currency",
+                      "Boolean", "Integer", "LongInteger", "SingleReal", "Real"]
+        fail_types = []
+        self.verify_import_export_types(data, default_type, pass_types, fail_types)
+
+    def verify_import_export_types(self, data: list, default_type: str, pass_types: list, fail_types: list):
+        """Helper function that takes a column of data and roundtrips export/import
+           and verifies that the data is the expected type"""
+        self.assertEqual(len(pass_types) + len(fail_types), 12,
+                         "Only %s SBDF types tested.  Should be all 12!" % (len(pass_types) + len(fail_types)))
+        dataframe = pandas.DataFrame({"x": data})
+
+        # validate expected default case (autodetected type)
+        # if default is None expect failure
+        if not default_type:
+            with self.assertRaises(sbdf.SBDFError):
+                sbdf.export_data(dataframe, "output.sbdf")
+        else:
+            _, newdf_types = self.roundtrip_dataframe(dataframe)
+            self.assertEqual(newdf_types["x"], default_type)
+
+        # validate expected passing cases
+        for dftype in pass_types:
+            with self.subTest(dftype=dftype):
+                sbdf.set_spotfire_types(dataframe, {"x": dftype})
+                _, newdf_types = self.roundtrip_dataframe(dataframe)
+                self.assertEqual(newdf_types["x"], dftype)
+
+        # validate expected failure cases
+        for dftype in fail_types:
+            with self.subTest(dftype=dftype):
+                sbdf.set_spotfire_types(dataframe, {"x": dftype})
+                with self.assertRaises(sbdf.SBDFError):
+                    self.roundtrip_dataframe(dataframe)
+
+    @staticmethod
+    def roundtrip_dataframe(dataframe: pandas.DataFrame) -> typing.Tuple[pandas.DataFrame, pandas.Series]:
+        """Write out a dataframe to SBDF and immediately read it back in to a new one"""
+        sbdf.export_data(dataframe, "output.sbdf")
+        newdf = sbdf.import_data("output.sbdf")
+        newdf_types = sbdf.get_spotfire_types(newdf)
+        return newdf, newdf_types

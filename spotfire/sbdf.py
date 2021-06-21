@@ -45,7 +45,7 @@ try:
 except ImportError:
     seaborn = None
 
-__all__ = ["import_data", "export_data"]
+__all__ = ["import_data", "export_data", "get_spotfire_types", "set_spotfire_types"]
 
 
 # Public Functions
@@ -73,7 +73,7 @@ def import_data(sbdf_file: typing.Union[str, bytes, int]) -> pd.DataFrame:
         table_metadata_dict = _import_table_metadata(tmeta)
 
         # Process column metadata
-        pd_data, pd_dtypes, column_metadata_dict, column_names = _import_column_metadata(tmeta)
+        pd_data, pd_dtypes, sf_datatypes, column_metadata_dict, column_names = _import_column_metadata(tmeta)
 
         # Read the table slices
         _import_table_slices(file, column_names, pd_data, tmeta)
@@ -85,6 +85,7 @@ def import_data(sbdf_file: typing.Union[str, bytes, int]) -> pd.DataFrame:
         dataframe = pd.concat(columns, axis=1)
         for col in column_names:
             dataframe[col].spotfire_column_metadata = column_metadata_dict[col]
+            dataframe[col].attrs['spotfire_type'] = sf_datatypes[col]
         if gpd is not None and table_metadata_dict.get('MapChart.IsGeocodingTable'):
             dataframe = _data_frame_to_geo_data_frame(dataframe, table_metadata_dict)
         with warnings.catch_warnings():
@@ -102,10 +103,12 @@ def _import_table_metadata(tmeta: '_TableMetadata') -> typing.Dict[str, typing.A
 
 def _import_column_metadata(tmeta: '_TableMetadata') -> typing.Tuple[typing.Dict[str, typing.List],
                                                                      typing.Dict[str, str],
+                                                                     typing.Dict[str, str],
                                                                      typing.Dict[str, typing.Dict[str, typing.Any]],
                                                                      typing.List[str]]:
     pd_data = {}
     pd_dtypes = {}
+    spotfire_types = {}
     column_metadata_dict = {}
     column_names = []
     for i in range(tmeta.column_count()):
@@ -118,8 +121,13 @@ def _import_column_metadata(tmeta: '_TableMetadata') -> typing.Tuple[typing.Dict
         # add a new list to hold the column
         pd_data[cm_column_name] = []
 
+        sbdf_type = _ColumnMetadata.get_type(cmeta)
+
+        # store the Spotfire data type for the column
+        spotfire_types[cm_column_name] = sbdf_type.to_typename_string()
+
         # get the pandas dtype for constructing this column
-        pd_dtypes[cm_column_name] = _ColumnMetadata.get_type(cmeta).to_dtype_name()
+        pd_dtypes[cm_column_name] = sbdf_type.to_dtype_name()
 
         # get the remaining column metadata
         cm_dict = {}
@@ -129,7 +137,7 @@ def _import_column_metadata(tmeta: '_TableMetadata') -> typing.Tuple[typing.Dict
             cm_dict[cmeta.names[j]] = cmeta.values[j].data
         column_metadata_dict[cm_column_name] = cm_dict
 
-    return pd_data, pd_dtypes, column_metadata_dict, column_names
+    return pd_data, pd_dtypes, spotfire_types, column_metadata_dict, column_names
 
 
 def _import_table_slices(file: typing.BinaryIO, column_names: typing.List[str],
@@ -171,9 +179,11 @@ def export_data(obj: typing.Any, sbdf_file: typing.Union[str, bytes, int], defau
         tmeta = _export_table_metadata(table_metadata)
         row_count = _export_column_metadata(columns, column_names, column_types, column_metadata, tmeta)
         tmeta.write(file)
-
-        # Write out the table and column slices
-        _export_table_slices(columns, column_names, column_types, file, row_count, tmeta)
+        try:
+            # Write out the table and column slices
+            _export_table_slices(columns, column_names, column_types, file, row_count, tmeta)
+        except:
+            raise SBDFError("Failure while exporting data")
 
 
 def _export_columnize_data(obj: typing.Any, default_column_name: str) -> \
@@ -323,6 +333,38 @@ def _export_table_slices(columns: typing.Dict[str, typing.List], column_names: t
         row_offset += slice_row_count
     _TableSlice.write_end(file)
 
+def get_spotfire_types(dataframe: pd.DataFrame) -> pd.Series:
+    """Get Spotfire column type names from an imported :class:`pandas.DataFrame`
+
+    :param dataframe: a pandas.DataFrame, typically imported by sbdf.import_data
+    :return a :class:`pandas.Series` containing column names and their associated
+            Spotfire data type names, if declared
+    """
+    spotfire_types = {}
+    for col in dataframe.columns:
+        try:
+            spotfire_types[col] = dataframe[col].attrs['spotfire_type']
+        except KeyError:
+            spotfire_types[col] = None
+    return pd.Series(spotfire_types)
+
+def set_spotfire_types(dataframe: pd.DataFrame, column_types: typing.Dict[str, str]):
+    """Set Spotfire types to use when exporting a :class:`pandas.DataFrame` to SBDF
+
+    :note If any column name or type is invalid, a warning will be issued but any
+    other valid assignments will succeed
+
+    :param dataframe: the pandas.DataFrame to set column types on
+    :param column_types: Dict mapping column names to column types, e.g. `{"x": "Integer"}`
+    """
+    for col, spotfire_type in column_types.items():
+        if col not in dataframe:
+            warnings.warn("Column '%s' not found in data" % col)
+            continue
+        if not _ValueTypeId.from_typename_string(spotfire_type):
+            warnings.warn("Spotfire type '%s' not recognized" % spotfire_type)
+            continue
+        dataframe[col].attrs['spotfire_type'] = spotfire_type
 
 # Exceptions
 
@@ -1014,10 +1056,23 @@ class _ValueTypeId(enum.IntEnum):
     def infer_from_dtype(series: pd.Series, series_description: str) -> '_ValueTypeId':
         """determine the proper valuetype id from the Pandas dtype of a series"""
         dtype = series.dtype.name
+
+        # check if SBDF type is explicitly set
+        sbdf_type = None
+        if 'spotfire_type' in series.attrs:
+            sbdf_type = _ValueTypeId.from_typename_string(series.attrs['spotfire_type'])
+        if sbdf_type:
+            return sbdf_type
+
         if dtype == "object":
+            # always use declared type for "object" if provided
+            if sbdf_type:
+                return sbdf_type
             return _ValueTypeId.infer_from_type(series.tolist(), series_description)
+
         if dtype == "category":
             return _ValueTypeId.infer_from_dtype(series.astype(series.cat.categories.dtype), series_description)
+
         typeid = {
             "bool": _ValueTypeId.BOOL,
             "int32": _ValueTypeId.INT,
@@ -1033,6 +1088,23 @@ class _ValueTypeId(enum.IntEnum):
             raise SBDFError("unknown dtype '%s' in %s" % (dtype, series_description))
         return typeid
 
+    @staticmethod
+    def from_typename_string(typename: str) -> '_ValueTypeId':
+        """convert this Spotfire type name to valuetype ID"""
+        return {
+            "Boolean": _ValueTypeId.BOOL,
+            "Integer": _ValueTypeId.INT,
+            "LongInteger": _ValueTypeId.LONG,
+            "SingleReal": _ValueTypeId.FLOAT,
+            "Real": _ValueTypeId.DOUBLE,
+            "DateTime": _ValueTypeId.DATETIME,
+            "Date": _ValueTypeId.DATE,
+            "Time": _ValueTypeId.TIME,
+            "TimeSpan": _ValueTypeId.TIMESPAN,
+            "String": _ValueTypeId.STRING,
+            "Binary": _ValueTypeId.BINARY,
+            "Currency": _ValueTypeId.DECIMAL
+        }.get(typename)
 
 class _ValueType:
     def __init__(self, type_id: int) -> None:
@@ -1205,7 +1277,8 @@ class _ValueType:
 
     @staticmethod
     def _to_bytes_string(obj: str) -> bytes:
-        return obj.encode("utf-8")
+        # coerce it to a string in case it's not already
+        return obj.__str__().encode("utf-8")
 
     @staticmethod
     def _to_bytes_binary(obj: bytes) -> bytes:
@@ -1234,6 +1307,9 @@ class _ValueType:
             return getattr(self, "_to_bytes_" + self.type_id.name.lower(), lambda x: None)(obj)
         except (struct.error, bitstring.CreationError, UnicodeError) as exc:
             raise SBDFError("cannot convert '%s' to Spotfire %s type; value is outside representable range" %
+                            (obj, self.type_id.to_typename_string())) from exc
+        except (AttributeError, TypeError) as exc:
+            raise SBDFError("cannot convert '%s' to Spotfire %s type; incompatible types" %
                             (obj, self.type_id.to_typename_string())) from exc
 
     def missing_value(self) -> typing.Any:
