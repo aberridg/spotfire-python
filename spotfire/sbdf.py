@@ -182,9 +182,8 @@ def export_data(obj: typing.Any, sbdf_file: typing.Union[str, bytes, int], defau
         try:
             # Write out the table and column slices
             _export_table_slices(columns, column_names, column_types, file, row_count, tmeta)
-        except:
-            raise SBDFError("Failure while exporting data")
-
+        except Exception as exc:
+            raise SBDFError("Failure while exporting data") from exc
 
 def _export_columnize_data(obj: typing.Any, default_column_name: str) -> \
         typing.Tuple[typing.Dict[str, typing.List[typing.Any]],
