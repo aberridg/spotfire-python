@@ -1,4 +1,4 @@
-# Copyright © 2021. TIBCO Software Inc.
+# Copyright © 2021. Cloud Software Group, Inc.
 # This file is subject to the license terms contained
 # in the license file that is distributed with this file.
 
@@ -7,8 +7,12 @@
 import abc
 import argparse
 import datetime
+import fileinput
+import glob
+from importlib import metadata as imp_md
 import io
 import json
+import locale
 import os
 import platform
 import re
@@ -22,10 +26,13 @@ import uuid
 from xml.etree import ElementTree
 import zipfile
 
-from pip._vendor.packaging import version as pip_version
+from packaging import requirements as pkg_req, utils as pkg_utils, version as pkg_version
 
-import spotfire
-import spotfire.version
+from spotfire import cabfile, codesign, version as sf_version
+
+_Brand = dict[str, typing.Any]
+_InstalledPackages = dict[str, str]
+_PayloadFileMapping = tuple[str, str]
 
 # Command line parsing helpers
 
@@ -70,7 +77,7 @@ def _error(msg: str) -> None:
 
 class _SpkVersion:
     """Represents a version number as presented in Spotfire SPK package files.  Version numbers have four components
-    (organized from largest scope to smallest): major, minor, service pack, and identifier."""
+    (organized from the largest scope to smallest): major, minor, service pack, and identifier."""
 
     def __init__(self, major: int = 1, minor: int = 0, service_pack: int = 0, identifier: int = 0) -> None:
         self._versions = [major, minor, service_pack, identifier]
@@ -80,6 +87,7 @@ class _SpkVersion:
         """Parse a string into a version.
 
         :param str_: the string to parse into a version number
+        :return: new SPK package version object
         """
         components = str_.split(".")
         if len(components) > 4:
@@ -88,9 +96,14 @@ class _SpkVersion:
 
     @staticmethod
     def from_version_info(identifier: int) -> '_SpkVersion':
-        """Extract the SPK version of the running Python installation."""
+        """Extract the SPK version of the running Python installation.
+
+        :param identifier: fourth component for the generated version object
+        :return: new SPK package version object of the form `X.YYZZ.ABBCC.identifier` (where `X.Y.Z` is the Python
+                   version, and `A.B.C` is the version of the `spotfire` package)
+        """
         spk_minor = (sys.version_info.minor * 100) + sys.version_info.micro
-        spotfire_version_components = spotfire.version.__version__.split(".")
+        spotfire_version_components = sf_version.__version__.split(".")
         spk_service_pack = (int(spotfire_version_components[0]) * 10000) + \
                            (int(spotfire_version_components[1]) * 100) + \
                            (int(spotfire_version_components[2]))
@@ -98,8 +111,7 @@ class _SpkVersion:
         return version
 
     def __str__(self):
-        # pylint: disable=consider-using-f-string
-        return "%d.%d.%d.%d" % tuple(self._versions)
+        return '.'.join([str(x) for x in self._versions])
 
     def __repr__(self):
         return f"{self.__class__.__module__}.{self.__class__.__qualname__}{tuple(self._versions)!r}"
@@ -114,7 +126,7 @@ class _SpkVersion:
         self._versions[1] += 1
         self._versions[2:] = [0, 0]
 
-    def _decrement(self, pos, wrap_around) -> None:
+    def _decrement(self, pos, wrap_around: int) -> None:
         while pos >= 0:
             self._versions[pos] -= 1
             if self._versions[pos] < 0:
@@ -152,32 +164,10 @@ class _SpkVersion:
     def __lt__(self, other):
         if not isinstance(other, _SpkVersion):
             return NotImplemented
-        return self._versions < other._versions  # pylint: disable=protected-access
+        return self._versions < other._versions
 
 
-def _tee(command: typing.List[str], encoding: str = "utf-8") -> typing.List[str]:
-    """Run an external command, capturing the output and displaying it to standard output.  Standard error is collapsed
-    into the same stream as standard output.
-
-    :param command: the command to run
-    :param encoding: the encoding to use to convert the bytes of the command's output into str
-    :return: a list of the lines of the command's output
-    :raises CalledProcessError: if the command returns a non-zero exit status
-    """
-    output = []
-    sys.stdout.flush()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
-        for line in process.stdout:
-            line = line.decode(encoding)
-            output.append(line)
-            sys.stdout.write(line)
-        return_code = process.wait()
-        if return_code:
-            raise subprocess.CalledProcessError(return_code, command[0])
-        return output
-
-
-def _brand_file(filename: str, data: typing.Dict, comment: str, line_length: int = 72) -> None:
+def _brand_file(filename: str, data: _Brand, comment: str, line_length: int = 72) -> None:
     """Brand a file with the JSON representation of data.
 
     :param filename: the filename of the file to brand
@@ -209,7 +199,7 @@ def _brand_file(filename: str, data: typing.Dict, comment: str, line_length: int
         file.writelines(lines)
 
 
-def _read_brand(filename: str, comment: str) -> typing.Dict:
+def _read_brand(filename: str, comment: str) -> _Brand:
     """Read a brand from a file.
 
     :param filename: the filename of the file with the brand
@@ -229,22 +219,40 @@ def _read_brand(filename: str, comment: str) -> typing.Dict:
 
 
 class _PackageBuilder(metaclass=abc.ABCMeta):
-    # pylint: disable=too-many-instance-attributes,consider-using-f-string
+    # pylint: disable=too-many-instance-attributes
+    excludes: list[str]
+    _contents: list[_PayloadFileMapping]
+    _cleanup_dirs: list[str]
+    _cleanup_files: list[str]
+
     def __init__(self) -> None:
-        self.name = None
-        self.version = None
-        self.id = None
-        self.output = None
+        self.name = ""
+        self.version = _SpkVersion()
+        self.id = ""
+        self.output = ""
         self.excludes = []
-        self.last_scan_dir = None
+        self.last_scan_dir = ""
         self._contents = []
+        self._cleanup_dirs = []
+        self._cleanup_files = []
         if platform.system() == "Windows":
             self._site_packages_dirname = "Lib\\site-packages"
         else:
-            self._site_packages_dirname = "lib/python%d.%d/site-packages" % sys.version_info[:2]
+            self._site_packages_dirname = f"lib/python{'.'.join([str(x) for x in sys.version_info[:2]])}/site-packages"
+
+    def cleanup(self):
+        """Clean up temporary files used to create the package."""
+        for dirname in self._cleanup_dirs:
+            shutil.rmtree(dirname)
+        for filename in self._cleanup_files:
+            os.unlink(filename)
 
     def add(self, filename: str, archive_name: str) -> None:
-        """Add a file to the package."""
+        """Add a file to the package.
+
+        :param filename: the file name on disk to add to the package
+        :param archive_name: the name within the package to add the file as
+        """
         archive_backslash = archive_name.replace("/", "\\")
         if self.excludes is not None:
             for exclude in self.excludes:
@@ -252,10 +260,21 @@ class _PackageBuilder(metaclass=abc.ABCMeta):
                     return
         self._contents.append((filename, archive_backslash))
 
+    @abc.abstractmethod
+    def add_resource(self, name: str, location: str) -> None:
+        """Add a public resource provided by this package.
+
+        :param name: name of the resource to add to this package
+        :param location: the location within the package the resource refers to
+        """
+
     def scan_python_installation(self, prefix: str) -> None:
-        """Scan all the files in the Python installation."""
+        """Scan all the files in the Python installation.
+
+        :param prefix: the directory within the package to locate the Python installation at
+        """
         try:
-            py_prefix = sys.base_prefix
+            py_prefix: str = sys.base_prefix
         except AttributeError:
             py_prefix = getattr(sys, "real_prefix", sys.prefix)
         _message(f"Scanning Python installation at {py_prefix} for files to include.")
@@ -271,67 +290,78 @@ class _PackageBuilder(metaclass=abc.ABCMeta):
                     self.add(filename_ondisk, filename_payload)
 
     def scan_spotfire_package(self, prefix: str) -> None:
-        """Scan the 'spotfire' package (and it's .dist-info directory) into site-packages."""
+        """Scan the 'spotfire' package (and it's .dist-info directory) into spotfire-packages.
+
+        :param prefix: the directory within the package the Python installation is located at
+        """
         _message("Scanning 'spotfire' package files.")
 
-        # Grab the files of the 'spotfire' package.
-        for root, _, filenames in os.walk(spotfire.__path__[0]):
-            for filename in filenames:
-                filename_ondisk = os.path.join(root, filename)
-                filename_relative = os.path.relpath(filename_ondisk, spotfire.__path__[0])
-                filename_payload = f"{prefix}/{self._site_packages_dirname}/spotfire/{filename_relative}"
-                self.add(filename_ondisk, filename_payload)
+        sf_dist = imp_md.distribution("spotfire")
+        if isinstance(sf_dist, imp_md.PathDistribution) and _is_editable_distribution(sf_dist):
+            _message("Editable 'spotfire' package installed; resulting SPK package will not function properly.")
+        if sf_dist.files:
+            for file in sf_dist.files:
+                filename_payload = f"{prefix}/spotfire-packages/{'/'.join(file.parts)}"
+                self.add(str(file.locate()), filename_payload)
 
-        # Grab the .dist-info directory.
-        site_packages_dir = os.path.dirname(spotfire.__path__[0])
-        spotfire_dist_info_re = re.compile(r"^spotfire(-.*)?\.(dist|egg)-info$")
-        for subdir in next(os.walk(site_packages_dir))[1]:
-            if spotfire_dist_info_re.match(subdir):
-                spotfire_dist_info_dir = os.path.join(site_packages_dir, subdir)
-                for root, _, filenames in os.walk(spotfire_dist_info_dir):
-                    for filename in filenames:
-                        filename_ondisk = os.path.join(root, filename)
-                        filename_relative = os.path.relpath(filename_ondisk, spotfire_dist_info_dir)
-                        filename_payload = f"{prefix}/{self._site_packages_dirname}/{subdir}/{filename_relative}"
-                        self.add(filename_ondisk, filename_payload)
-
-    def scan_requirements_txt(self, requirements: str, prefix: str, prefix_direct: bool = False,
-                              use_deny_list: bool = False) -> \
-            typing.Tuple[typing.Callable[[], None], typing.Dict[str, str]]:
+    def scan_requirements_txt(self, requirements: str, constraint: str, prefix: str, prefix_direct: bool = False,
+                              use_deny_list: bool = False) -> _InstalledPackages:
         """Scan the contents of a pip 'requirements.txt' file into site-packages.
 
         :param requirements: the filename of the requirements file that declares the pip packages to put in the
-        SPK package
+                               SPK package
+        :param constraint: the filename of the constraints file that declares the constraints pip should apply
+                             when resolving requirements
         :param prefix: the directory prefix under which the pip packages should be scanned into
-        :param prefix_direct: whether to scan the pip packages into the ``site-packages`` directory
+        :param prefix_direct: whether to scan the pip packages into the ``site-packages`` directory or directly
+                                into the prefix directory
         :param use_deny_list: whether to delete the packages included with the Interpreter from the
                                 temporary package area before bundling.
-        :return: a function that cleans up the temporarily installed packages, and a dict that maps the names of
-        pip packages that were scanned into the SPK package to their installed versions
+        :return: a dict that maps the names of pip packages that were scanned into the SPK package to their
+                   installed versions
         """
+        # pylint: disable=too-many-positional-arguments,too-many-locals,too-many-branches
+
         tempdir = tempfile.mkdtemp(prefix="spk")
         self.last_scan_dir = tempdir
-
-        def cleanup():
-            """Cleanup the created tempdir."""
-            shutil.rmtree(tempdir)
+        self._cleanup_dirs.append(tempdir)
 
         # Install the packages from the requirement file into tempdir.
         _message(f"Installing pip packages from {requirements} to temporary location.")
-        try:
-            pip_output = _tee([sys.executable, "-m", "pip", "install", "--upgrade", "--disable-pip-version-check",
-                               "--target", tempdir, "--requirement", requirements])
-        except subprocess.CalledProcessError:
+        command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                   "--target", tempdir, "--requirement", requirements]
+        if constraint:
+            command.extend(["--constraint", constraint])
+        pip_install = subprocess.run(command, check=False)
+        if pip_install.returncode:
             _error("Error installing required packages.  Aborting.")
-            cleanup()
+            self.cleanup()
             sys.exit(1)
 
-        # Update the brand with the package versions.
-        package_versions = self._packages_installed(pip_output)
+        # List packages that were installed.
+        command = [sys.executable, "-m", "pip", "list", "--disable-pip-version-check", "--path", tempdir,
+                   "--format", "json"]
+        pip_list = subprocess.run(command, capture_output=True, check=False)
+        if pip_list.returncode:
+            _error("Error installing required packages.  Aborting.")
+            self.cleanup()
+            sys.exit(1)
+        package_versions_json = json.loads(pip_list.stdout.decode(locale.getpreferredencoding()))
+        package_versions = {x['name']: x['version'] for x in package_versions_json}
+
+        # Update RECORD files in tempdir to remove references to '../../'
+        record_files = glob.glob(os.path.join(tempdir, "*.dist-info/RECORD"))
+        with fileinput.input(record_files, encoding="utf-8", inplace=True) as record_input:
+            for line in record_input:
+                line = line.rstrip()
+                if line.startswith("../../"):
+                    print(line[6:])
+                else:
+                    print(line)
 
         # Delete duplicate packages if needed
         if use_deny_list:
-            package_versions = self.scan_duplicate_packages(tempdir, package_versions)
+            package_versions = self.remove_included_packages(tempdir, package_versions)
 
         # Scan all files in tempdir
         _message("Scanning package files from temporary location.")
@@ -346,97 +376,142 @@ class _PackageBuilder(metaclass=abc.ABCMeta):
                 if not filename_relative.startswith(f"bin{os.path.sep}"):
                     self.add(filename_ondisk, filename_payload)
 
-        return cleanup, package_versions
-
-    @staticmethod
-    def scan_duplicate_packages(tempdir: str, package_versions):
-        """ When building a custom Python Packages SPK, find and delete duplicate packages.
-        :return:
-        """
-        # Disable Pylint `Too many nested blocks`
-        # pylint: disable=too-many-nested-blocks,too-many-locals
-        # Use the spotfire requirements file as a deny list.
-        _message(f"{spotfire.__path__[0]}")
-        if "spotfire.zip" in spotfire.__path__[0]:
-            # Handle getting the requirements.txt from a zip file.
-            with zipfile.ZipFile(os.path.split(spotfire.__path__[0])[0]) as zfile:
-                with zfile.open("spotfire/requirements.txt") as deny_file:
-                    deny_requirements = deny_file.readlines()
-                deny_list = [line.decode("utf-8").rstrip('\n') for line in deny_requirements]
+        # Always install the requirements and constraints files at the top level of the package; it's just that the
+        # top level depends on whether we're building a server SPK (which will have a "root" directory) or an analyst
+        # SPK (which will not)
+        if prefix.startswith("root/"):
+            additional_loc = "root/"
         else:
-            # Handle getting the requirements.txt directly from the file system.
-            with open(os.path.join(spotfire.__path__[0], "requirements.txt"), encoding="utf8") as deny_file:
-                deny_requirements = deny_file.readlines()
-            deny_list = [line.rstrip('\n') for line in deny_requirements]
+            additional_loc = ""
 
-        # Compile a Set of directories to delete
-        package_directories = set()
-        # Go through each package
-        for package_name in deny_list:
-            # Remove version numbers from package name and keep a copy of the original name
-            package_name = package_name.split(' ', 1)[0]
-            original_package_name = package_name
-            # Convert dash to underscore for file access
-            package_name = package_name.replace('-', '_')
-            # Walk through each directory
-            for root, directory_names, _ in os.walk(tempdir):
-                for directory_name in directory_names:
-                    # look for the `dist-info` directory for each package
-                    if directory_name.startswith(package_name) and directory_name.endswith('dist-info'):
-                        package_directories.add(directory_name)
-                        # Go through the RECORD file from the package dist-info and delete each listed file
-                        record_file = os.path.join(root, directory_name, 'RECORD')
-                        if os.path.isfile(record_file):
-                            with open(record_file, encoding="utf8") as open_record_file:
-                                record_files = open_record_file.readlines()
-                            for file in record_files:
-                                # Clean up the path to each file.
-                                # RECORD has file name, then comma followed by info we don't need.
-                                file = file.split(',', 1)[0]
-                                # Files in "/bin" start with "../../" but we don't need that.
-                                if file.startswith('../../'):
-                                    file = file.split('../../', 1)[1]
-                                # Get the path to the file
-                                file = os.path.join(root, file)
-                                # Delete the file if it exists
-                                if os.path.isfile(file):
-                                    os.remove(file)
-                                else:
-                                    _message(f"Could not find RECORD file {file}")
-                            _message(f"Deleted files listed in RECORD for {directory_name}")
-                            package_versions.pop(original_package_name, None)
-                    if directory_name == package_name:
-                        package_directories.add(directory_name)
-        # Manually add 'dateutil's non-standard package name
-        package_directories.add('dateutil')
-        # Delete the packages' directories
-        for package_directory in package_directories:
-            package_directory_file = os.path.join(tempdir, package_directory)
-            if os.path.isdir(package_directory_file):
-                try:
-                    shutil.rmtree(package_directory_file)
-                except OSError:
-                    _message(f"Unable to remove directory {package_directory_file}")
+        # Add the requirements file to the package (only if building a packages SPK,
+        # which will ask to use the deny list)
+        if use_deny_list:
+            self.add(requirements, f"{additional_loc}requirements-{self.name}.txt")
+
+        # Add the constraints file to the package
+        if constraint:
+            self.add(constraint, f"{additional_loc}constraints-{self.name}.txt")
+
+        return package_versions
+
+    def remove_included_packages(self, tempdir: str, package_versions: _InstalledPackages) -> _InstalledPackages:
+        """Find and delete packages that would be included with an interpreter Spotfire package from a directory of
+        packages.
+
+        :param tempdir: the temporary on-disk directory to which the packages to scan for duplicates have been
+                          downloaded
+        :param package_versions: the dictionary returned by :method:`scan_requirements_txt` that maps package names
+                                   to versions
+        :return: `package_versions`, but with duplicate packages removed from the mapping
+        """
+        # Use the spotfire requirements file as a deny list.
+        deny_list = self.requirements_of("spotfire")
+
+        # Find all distributions in the temp directory
+        dist_info_dirs = glob.glob(os.path.join(tempdir, "*.dist-info"))
+        dist_infos = [imp_md.Distribution.at(x) for x in dist_info_dirs]
+
+        # Clean any distributions on our deny list
+        for dist in dist_infos:
+            if dist.name in deny_list:
+                dist_name = dist.name
+                self._remove_package_files(tempdir, dist)
+                del package_versions[dist_name]
+
         _message("Completed removing files and directories for packages on the deny list.")
         return package_versions
 
-    @staticmethod
-    def _packages_installed(pip_output):
-        """Determine what packages were installed by parsing pip's output."""
-        _installed = "Successfully installed "
-        # Scan the output for the line with the magic string
-        installed_line = None
-        for i in reversed(pip_output):
-            if i.startswith(_installed):
-                installed_line = i
-        # Now parse the line to get the package versions
-        package_versions = {}
-        if installed_line:
-            installed_packages = installed_line[len(_installed):]
-            for pkg in installed_packages.strip().split(" "):
-                pkg_dash_pos = pkg.rfind("-")
-                package_versions[pkg[:pkg_dash_pos]] = pkg[pkg_dash_pos + 1:]
-        return package_versions
+    def _process_package_requirements(self, requirement, extra: typing.Optional[str] = None,
+                                      seen: typing.Optional[set[str]] = None) -> None:
+        """Process the child requirements of a requirement object."""
+        # Do not process if the requested extra is not part of the current requirement.
+        if requirement.marker and not requirement.marker.evaluate({"extra": extra}):
+            return
+
+        # Record the package name in the seen set.
+        if seen is None:
+            seen = set()
+        seen.add(requirement.name)
+
+        # Get the child requirements of the current requirement.
+        try:
+            requires = imp_md.requires(requirement.name)
+        except imp_md.PackageNotFoundError:
+            requires = None
+
+        # Now recurse if any child requirements exist.
+        if requires:
+            for req in requires:
+                child_req = pkg_req.Requirement(req)
+                if pkg_utils.canonicalize_name(child_req.name) not in seen:
+                    self._process_package_requirements(child_req, None, seen)
+                    for child_extra in child_req.extras:
+                        self._process_package_requirements(child_req, child_extra, seen)
+
+    def requirements_of(self, package: str, extra: typing.Optional[str] = None) -> set[str]:
+        """Determine the requirements recursively of a package.
+
+        :param package: the name of the package
+        :param extra: the extra for the package
+        :returns: set of package names that are recursively as requirements of the package
+        """
+        packages_seen: set[str] = set()
+        self._process_package_requirements(pkg_req.Requirement(package), extra, packages_seen)
+        return packages_seen
+
+    def requirements_from(self, requirements: str) -> set[str]:
+        """Determine the requirements recursively of a requirements file.
+
+        :param requirements: the text contents of the requirements to recursively determine
+        :returns: set of package names that are recursively included by the requirements file
+        """
+        packages_seen: set[str] = set()
+        for line in requirements.splitlines():
+            line = re.sub('#.*$', '', line)
+            line = line.strip()
+            if line:
+                req = pkg_req.Requirement(line)
+                self._process_package_requirements(req, None, packages_seen)
+        return packages_seen
+
+    def _remove_package_files(self, tempdir: str, dist: imp_md.Distribution) -> None:
+        """Remove all files in this distribution.  Note that after this method returns, the distribution object does
+        not contain any valid information since the backing metadata has been removed."""
+        to_delete = set()
+        if dist.files:
+            for file in dist.files:
+                to_delete.add(str(file.locate()))
+
+        name = dist.name
+        version = dist.version
+        for file_loc in to_delete:
+            # Delete the file
+            os.remove(file_loc)
+
+            # Clean any empty directories created by the file deletion
+            file_dir = os.path.dirname(file_loc)
+            while file_dir != tempdir and not os.listdir(file_dir):
+                os.rmdir(file_dir)
+                file_dir = os.path.dirname(file_dir)
+
+        _message(f"Deleted files listed in RECORD for {name}-{version}.dist-info")
+
+    def scan_path_configuration_file(self, prefix: str) -> None:
+        """Add a path configuration file for the 'spotfire-packages' directory to the Python interpreter.
+
+        :param prefix: the directory within the package the Python installation is located at
+        """
+        _message("Adding path configuration file for spotfire-packages directory.")
+        fd, temp = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as file:
+            file.write('import sys, os; '
+                       'sys.path.insert(min([i for i, x in enumerate(["site-packages" in x for x in sys.path]) if x]), '
+                       'f"{sys.prefix}{os.sep}spotfire-packages")\n')
+        if platform.system() != 'Windows':
+            os.chmod(temp, 0o644)
+        self._cleanup_files.append(temp)
+        self.add(temp, f"{prefix}/{self._site_packages_dirname}/spotfire.pth")
 
     @abc.abstractmethod
     def _payload_name(self) -> str:
@@ -459,7 +534,7 @@ class _PackageBuilder(metaclass=abc.ABCMeta):
             "SchemaVersion": "2.0",
             "Name": self.name,
             "Version": str(self.version),
-            "LastModified": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
+            "LastModified": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
             "SeriesId": self.id,
             "InstanceId": str(uuid.uuid4()),
             "CabinetName": self._payload_name(),
@@ -502,36 +577,50 @@ class _PackageBuilder(metaclass=abc.ABCMeta):
             os.unlink(payload_tempfile)
 
 
+def _is_editable_distribution(dist: imp_md.PathDistribution) -> bool:
+    # .egg-info implies we're in a development environment
+    editable = ".egg-info" in str(dist._path)  # pylint: disable=protected-access
+    # Otherwise, check for editable (`pip install -e ...`) installs
+    direct_text = dist.read_text("direct_url.json")
+    if direct_text:
+        direct = json.loads(direct_text)
+        if "dir_info" in direct:
+            direct_info = direct["dir_info"]
+            if "editable" in direct_info:
+                editable = direct_info["editable"]
+    return editable
+
+
+def _extract_package_requirements(package_name: str, requirements_file,
+                                  environment: typing.Optional[dict[str, str]] = None) -> None:
+    """Extract the requirements of an installed package to a requirements file.
+
+    :param package_name: the name of the package to extract requirements of
+    :param requirements_file: an opened file to write the requirements to
+    :param environment: additions to the environment used to determine if markers in the requirements are applicable
+    """
+    _message(f"Extracting '{package_name}' package requirements to {requirements_file.name}.")
+    requires = imp_md.requires(package_name)
+    if requires:
+        for req in requires:
+            req_req = pkg_req.Requirement(req)
+            if req_req.marker and not req_req.marker.evaluate(environment):
+                continue
+            print(req, file=requirements_file)
+
+
 def _et_to_bytes(element: ElementTree.Element) -> bytes:
     # Add indentation
-    _et_indent(element)
+    ElementTree.indent(element)
 
     # Serialize the element to a string
     temp_io = io.BytesIO()
+    # noinspection PyTypeChecker
     ElementTree.ElementTree(element).write(temp_io, encoding="utf-8", xml_declaration=True)
     return temp_io.getvalue()
 
 
-def _et_indent(element: ElementTree.Element, indent="  ", level=0) -> None:
-    # pylint: disable=redefined-argument-from-local
-    indent_text = "\n" + (level * indent)
-    if element:
-        if not element.text or not element.text.strip():
-            element.text = indent_text + indent
-        if not element.tail or not element.tail.strip():
-            element.tail = indent_text
-        for element in element:
-            _et_indent(element, indent, level + 1)
-        if not element.tail or not element.tail.strip():
-            element.tail = indent_text
-    else:
-        if level and (not element.tail or not element.tail.strip()):
-            element.tail = indent_text
-
-
 class _ZipPackageBuilder(_PackageBuilder):
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self):
         super().__init__()
         self.chmod_script_name = None
@@ -539,6 +628,14 @@ class _ZipPackageBuilder(_PackageBuilder):
     def _payload_name(self) -> str:
         """Get the payload archive name for this package."""
         return f"{self.name}.zip"
+
+    def add_resource(self, name: str, location: str) -> None:
+        """Add a public resource provided by this package.
+
+        :param name: name of the resource to add to this package
+        :param location: the location within the package the resource refers to
+        """
+        raise NotImplementedError
 
     def _create_module(self) -> ElementTree.Element:
         """Create the module document."""
@@ -561,7 +658,9 @@ class _ZipPackageBuilder(_PackageBuilder):
     def _build_payload(self, metadata: ElementTree.Element, module: ElementTree.Element, payload_dest: str) -> None:
         """Build the main payload archive for the SPK package."""
         metadata_files = metadata.find("Files")
-        payload_script = []
+        if metadata_files is None:
+            raise RuntimeError("no <Files> element found")
+        payload_script: typing.List[str] = []
         with zipfile.ZipFile(payload_dest, "w", compression=zipfile.ZIP_DEFLATED) as payload:
             # Add all files that are supposed to go into the package
             for filename_ondisk, filename_payload in self._contents:
@@ -576,8 +675,8 @@ class _ZipPackageBuilder(_PackageBuilder):
                     mode = stat.st_mode & 0o7777
                     ElementTree.SubElement(metadata_files, "File", {
                         "TargetRelativePath": filename_payload,
-                        "LastModifiedDate": datetime.datetime.utcfromtimestamp(stat.st_ctime).strftime(
-                            "%Y-%m-%dT%H:%M:%SZ"),
+                        "LastModifiedDate": (datetime.datetime.fromtimestamp(stat.st_ctime, datetime.timezone.utc)
+                                             .strftime("%Y-%m-%dT%H:%M:%SZ")),
                     })
                     if platform.system() != "Windows" and mode != 0o644:
                         payload_script += f"chmod {mode:o} {filename_payload_fwdslash}\n"
@@ -587,8 +686,8 @@ class _ZipPackageBuilder(_PackageBuilder):
                 payload_script.insert(0, "#!/bin/sh\n")
                 payload.writestr(f"root/Tools/Update/{self.chmod_script_name}.sh", "".join(payload_script))
                 ElementTree.SubElement(metadata_files, "File", {
-                    "TargetRelativePath": f"root\\Tools\\Update\\{self.chmod_script_name}",
-                    "LastModifiedDate": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "TargetRelativePath": f"root\\Tools\\Update\\{self.chmod_script_name}.sh",
+                    "LastModifiedDate": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 })
 
             # Add the module.xml file
@@ -605,16 +704,36 @@ class _CabPackageBuilder(_PackageBuilder):
         super().__init__()
         self.cert_file = None
         self.cert_password = None
+        self.cert_store_machine = False
+        self.cert_store_name = None
+        self.cert_store_cn = None
         self.timestamp_url = None
         self.sha256 = False
         self._resources = []
+
+    def process_signing_options(self, args) -> None:
+        """Process command line options for code signing.
+
+        :param args: the command line arguments processed by argparse
+        """
+        self.cert_file = getattr(args, "cert")
+        self.cert_password = getattr(args, "password")
+        self.cert_store_machine = getattr(args, "store_machine")
+        self.cert_store_name = getattr(args, "store_name")
+        self.cert_store_cn = getattr(args, "store_cn")
+        self.timestamp_url = getattr(args, "timestamp")
+        self.sha256 = getattr(args, "sha256")
 
     def _payload_name(self) -> str:
         """Get the payload archive name for this package."""
         return f"{self.name}.cab"
 
     def add_resource(self, name: str, location: str) -> None:
-        """Add a public resource provided by this package."""
+        """Add a public resource provided by this package.
+
+        :param name: name of the resource to add to this package
+        :param location: the location within the package the resource refers to
+        """
         self._resources.append((name, location))
 
     def _create_module(self) -> ElementTree.Element:
@@ -634,9 +753,9 @@ class _CabPackageBuilder(_PackageBuilder):
 
     def _build_payload(self, metadata: ElementTree.Element, module: ElementTree.Element, payload_dest: str) -> None:
         """Build the main payload archive for the SPK package."""
-        # pylint: disable=import-outside-toplevel
-        from spotfire import cabfile, codesign
         metadata_files = metadata.find("Files")
+        if metadata_files is None:
+            raise RuntimeError("no <Files> element found")
 
         with cabfile.CabFile(payload_dest) as payload:
             # Add all files that are supposed to go into the package
@@ -645,15 +764,22 @@ class _CabPackageBuilder(_PackageBuilder):
                 stat = os.lstat(filename_ondisk)
                 ElementTree.SubElement(metadata_files, "File", {
                     "TargetRelativePath": filename_payload,
-                    "LastModifiedDate": datetime.datetime.utcfromtimestamp(stat.st_ctime).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"),
+                    "LastModifiedDate": (datetime.datetime.fromtimestamp(stat.st_ctime, datetime.timezone.utc)
+                                         .strftime("%Y-%m-%dT%H:%M:%SZ")),
                 })
 
             # Add the module.xml file
             payload.writestr("module.xml", _et_to_bytes(module))
 
         # Codesign the payload
-        if self.cert_file:
+        if self.cert_store_name and self.cert_store_cn:
+            if self.cert_store_machine:
+                store_location = codesign.CertificateStoreLocation.LOCAL_MACHINE
+            else:
+                store_location = codesign.CertificateStoreLocation.CURRENT_USER
+            codesign.codesign_file_from_store(payload_dest, store_location, self.cert_store_name, self.cert_store_cn,
+                                              self.timestamp_url, self.sha256, self.sha256)
+        elif self.cert_file:
             codesign.codesign_file(payload_dest, self.cert_file, self.cert_password, self.timestamp_url, self.sha256,
                                    self.sha256)
 
@@ -663,11 +789,23 @@ class _CabPackageBuilder(_PackageBuilder):
 @subcommand([argument("spk-file", help="path to the SPK file to build"),
              argument("-v", "--version", default=1000, type=int, help="set the final component of the version number "
                                                                       "of the built SPK file (default: 1000)"),
-             argument("--exclude", action="append", help="exclude files from the built SPK file"),
+             argument("--exclude", action="append", metavar="PATH", help="exclude files from the built SPK file"),
+             argument("-c", "--constraint", metavar="FILE", help="apply the constraints in the file when installing "
+                                                                 "Python packages"),
              argument("--analyst", action="store_true", help="build the SPK file for use with Spotfire Analyst"),
-             argument("--cert", help="path to the certificate file to sign the package with (Analyst only)"),
+             argument("--cert", metavar="FILE", help="path to the certificate file to sign the package with (Analyst "
+                                                     "only)"),
              argument("--password", help="password for the certificate file (Analyst only)"),
-             argument("--timestamp", help="URL of a timestamping service to timestamp the package with (Analyst only)"),
+             argument("--store-machine", action="store_true", help="Use the 'local machine' certificate store "
+                                                                   "location to sign the package instead of the "
+                                                                   "'current user' (Analyst only)"),
+             argument("--store-name", metavar="STORE", help="name of the certificate store to find the certificate "
+                                                            "to sign the package in (Analyst only)"),
+             argument("--store-cn", metavar="STRING", help="substring of the subject common name of the certificate "
+                                                           "in the certificate store to sign the package with (Analyst "
+                                                           "only)"),
+             argument("--timestamp", metavar="URL", help="URL of a timestamping service to timestamp the package with "
+                                                         "(Analyst only)"),
              argument("--sha256", action="store_true", help="use SHA-256 for file and timestamp digests (Analyst only)")
              ])
 def python(args, hook=None) -> None:
@@ -679,18 +817,16 @@ def python(args, hook=None) -> None:
         print("Error: '--version' cannot be less than 0.")
         sys.exit(1)
     if version_identifier < 1000:
-        print("Warning: '--version' should not be less than 1000 in order to avoid conflicts with TIBCO-provided "
+        print("Warning: '--version' should not be less than 1000 in order to avoid conflicts with Spotfire-provided "
               "packages.")
 
     # Set up the package builder
     analyst = getattr(args, "analyst")
+    package_builder: _PackageBuilder
     if analyst:
         package_builder = _CabPackageBuilder()
         package_builder.excludes = getattr(args, "exclude")
-        package_builder.cert_file = getattr(args, "cert")
-        package_builder.cert_password = getattr(args, "password")
-        package_builder.timestamp_url = getattr(args, "timestamp")
-        package_builder.sha256 = getattr(args, "sha256")
+        package_builder.process_signing_options(args)
     else:
         package_builder = _ZipPackageBuilder()
         package_builder.excludes = getattr(args, "exclude")
@@ -705,7 +841,7 @@ def python(args, hook=None) -> None:
         package_builder.id = {
             "Windows": "b95fbe51-c013-4f65-8523-5bffcf19e6a8",
             "Linux": "6692a2c3-d43d-4224-a8db-26619ae8f268",
-        }.get(platform.system())
+        }.get(platform.system(), "")
         package_builder.name = f"Python Interpreter {platform.system()}"
 
     # Get the version of the Python installation
@@ -715,26 +851,28 @@ def python(args, hook=None) -> None:
     package_builder.version = _SpkVersion.from_version_info(version_identifier)
 
     # Scan the files required to create the Python interpreter SPK
-    def cleanup():
-        """Dummy cleanup function."""
-
     if analyst:
         prefix = "python"
         package_builder.add_resource("default.python.interpreter.directory", prefix)
     else:
         prefix = "root/python"
     package_builder.scan_python_installation(prefix)
+    package_builder.scan_path_configuration_file(prefix)
     package_builder.scan_spotfire_package(prefix)
-    spotfire_requirements = os.path.join(spotfire.__path__[0], "requirements.txt")
     try:
-        cleanup, _ = package_builder.scan_requirements_txt(spotfire_requirements, prefix)
+        with tempfile.NamedTemporaryFile(mode="wt", prefix="req", suffix=".txt", encoding="utf-8",
+                                         delete=False) as spotfire_requirements:
+            _extract_package_requirements("spotfire", spotfire_requirements)
+        constraints = getattr(args, "constraint")
+        package_builder.scan_requirements_txt(spotfire_requirements.name, constraints, prefix)
         if hook is not None:
             hook.scan_finished(package_builder)
 
         # Build the package
         package_builder.build()
     finally:
-        cleanup()
+        package_builder.cleanup()
+        os.remove(spotfire_requirements.name)
 
 
 @subcommand([argument("spk-file", help="path to the SPK file to build"),
@@ -745,38 +883,46 @@ def python(args, hook=None) -> None:
                                                                         "contain the version number of the built "
                                                                         "package"),
              argument("-n", "--name", help="set the internal module name of the built SPK file"),
+             argument("-c", "--constraint", metavar="FILE", help="apply the constraints in the file when installing "
+                                                                 "Python packages"),
              argument("--analyst", action="store_true", help="build the SPK file for use with Spotfire Analyst"),
-             argument("--cert", help="path to the certificate file to sign the package with (Analyst only)"),
+             argument("--cert", metavar="FILE", help="path to the certificate file to sign the package with (Analyst "
+                                                     "only)"),
              argument("--password", help="password for the certificate file (Analyst only)"),
-             argument("--timestamp", help="URL of a timestamping service to timestamp the package with (Analyst only)"),
+             argument("--store-machine", action="store_true", help="Use the 'local machine' certificate store "
+                                                                   "location to sign the package instead of the "
+                                                                   "'current user' (Analyst only)"),
+             argument("--store-name", metavar="STORE", help="name of the certificate store to find the certificate "
+                                                            "to sign the package in (Analyst only)"),
+             argument("--store-cn", metavar="STRING", help="substring of the subject common name of the certificate "
+                                                           "in the certificate store to sign the package with (Analyst "
+                                                           "only)"),
+             argument("--timestamp", metavar="URL", help="URL of a timestamping service to timestamp the package with "
+                                                         "(Analyst only)"),
              argument("--sha256", action="store_true", help="use SHA-256 for file and timestamp digests (Analyst only)")
              ])
 def packages(args) -> None:
     """Package a list of Python packages as an SPK package"""
-
-    def cleanup():
-        """Dummy cleanup function."""
-
     try:
         # Set up the package builder
         analyst = getattr(args, "analyst")
+        package_builder: _PackageBuilder
         if analyst:
             package_builder = _CabPackageBuilder()
-            package_builder.cert_file = getattr(args, "cert")
-            package_builder.cert_password = getattr(args, "password")
-            package_builder.timestamp_url = getattr(args, "timestamp")
-            package_builder.sha256 = getattr(args, "sha256")
+            package_builder.process_signing_options(args)
+            brand_subkey = "Analyst"
         else:
             package_builder = _ZipPackageBuilder()
             package_builder.chmod_script_name = "packages_chmod"
+            brand_subkey = "Server"
         package_builder.output = getattr(args, "spk-file")
         requirements_file = getattr(args, "requirements")
-        brand = _read_brand(requirements_file, "## spotfire.spk: ")
+        brand = _promote_brand(_read_brand(requirements_file, "## spotfire.spk: "), analyst)
         version = getattr(args, "version")
         force = getattr(args, "force")
         versioned_filename = getattr(args, "versioned_filename")
-        name = getattr(args, "name") or brand.get("BuiltName")
-        pkg_id = brand.get("BuiltId")
+        name = getattr(args, "name") or brand[brand_subkey].get("BuiltName")
+        pkg_id = brand[brand_subkey].get("BuiltId")
 
         # If name and id are not in the brand or given on the command line, generate reasonable defaults
         if name is None:
@@ -797,36 +943,72 @@ def packages(args) -> None:
         else:
             prefix = "root/python"
             prefix_direct = False
-        cleanup, installed_packages = package_builder.scan_requirements_txt(requirements_file, prefix, prefix_direct,
-                                                                            True)
+        constraints = getattr(args, "constraint")
+        installed_packages = package_builder.scan_requirements_txt(requirements_file, constraints, prefix,
+                                                                   prefix_direct, True)
 
         # Based on the packages we installed, determine how to increment the version number
-        _handle_versioning(package_builder, installed_packages, brand, version, force, versioned_filename)
+        _handle_versioning(package_builder, installed_packages, brand, brand_subkey, version, force, versioned_filename)
 
         # Build the package
         package_builder.build()
 
         # Now prepare the brand with the results of the build and apply it to our requirements file
-        brand["BuiltBy"] = sys.version
-        brand["BuiltAt"] = time.asctime(time.localtime(os.path.getmtime(package_builder.output)))
-        brand["BuiltFile"] = package_builder.output
-        brand["BuiltName"] = package_builder.name
-        brand["BuiltId"] = package_builder.id
-        brand["BuiltVersion"] = str(package_builder.version)
-        brand["BuiltPackages"] = installed_packages
+        brand[brand_subkey]["BuiltBy"] = sys.version
+        brand[brand_subkey]["BuiltAt"] = time.asctime(time.localtime(os.path.getmtime(package_builder.output)))
+        brand[brand_subkey]["BuiltFile"] = package_builder.output
+        brand[brand_subkey]["BuiltName"] = package_builder.name
+        brand[brand_subkey]["BuiltId"] = package_builder.id
+        brand[brand_subkey]["BuiltVersion"] = str(package_builder.version)
+        brand[brand_subkey]["BuiltPackages"] = installed_packages
         _brand_file(requirements_file, brand, "## spotfire.spk: ")
     finally:
-        cleanup()
+        # noinspection PyUnboundLocalVariable
+        package_builder.cleanup()
 
 
-def _handle_versioning(package_builder, installed_packages, brand, version, force, versioned_filename):
+def _promote_brand(brand: _Brand, analyst: bool) -> _Brand:
+    """Promote the version of a brand to the current representation.
+
+    :param brand: the brand to promote
+    :param analyst: whether the brand represents an Analyst package
+    :return: `brand`, promoted to the current version
+    """
+    brand_version = brand.get("BrandVersion") or 1
+
+    # Promote 1 to 2
+    if brand_version < 2:
+        if analyst:
+            brand = {"BrandVersion": 2, "Analyst": brand, "Server": {}}
+        else:
+            brand = {"BrandVersion": 2, "Analyst": {}, "Server": brand}
+
+    return brand
+
+
+def _handle_versioning(package_builder: _PackageBuilder, installed_packages: _InstalledPackages, brand: _Brand,
+                       brand_subkey: str, version: typing.Optional[str], force: bool, versioned_filename: bool) -> None:
+    """Properly handle the SPK package version given the packages installed by prior versions of the SPK package
+    (from the brand) and the set of packages that were downloaded.
+
+    :param package_builder: the package builder that is building the SPK package
+    :param installed_packages: the dictionary from :method:`_PackageBuilder.scan_requirements_txt` indicating the
+                                 packages and versions that were downloaded
+    :param brand: the brand containing information about the prior version of the SPK package
+    :param brand_subkey: the name of the subkey of the brand to look for information under
+    :param version: user-specified version for the SPK package, or `None` if unspecified
+    :param force: whether the user has asked to ignore error conditions in versioning
+    :param versioned_filename: whether the user has asked to have the generated version added to the SPK package's
+                                 filename
+    """
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     package_builder.version = _SpkVersion()
-    if "BuiltVersion" in brand:
-        package_builder.version = _SpkVersion.from_str(brand["BuiltVersion"])
+    if "BuiltVersion" in brand[brand_subkey]:
+        package_builder.version = _SpkVersion.from_str(brand[brand_subkey]["BuiltVersion"])
         package_builder.version.increment_minor()
-        if "BuiltPackages" in brand:
+        if "BuiltPackages" in brand[brand_subkey]:
             # Tick the major version if required
-            if _should_increment_major(brand["BuiltPackages"], installed_packages, force):
+            if _should_increment_major(brand[brand_subkey]["BuiltPackages"], installed_packages, force):
                 package_builder.version.increment_major()
     # Handle manually specified version numbers
     if version:
@@ -842,15 +1024,22 @@ def _handle_versioning(package_builder, installed_packages, brand, version, forc
                                         package_builder.output, 1)
 
 
-def _should_increment_major(old_packages, new_packages, force):
+def _should_increment_major(old_packages: _InstalledPackages, new_packages: _InstalledPackages, force: bool) -> bool:
+    """Determine if the major version of the SPK package should be incremented, instead of the minor version.
+
+    :param old_packages: dictionary mapping packages to versions present in the old version of the SPK package
+    :param new_packages: dictionary mapping packages to versions present in the new version of the SPK package
+    :param force: whether the user has asked to ignore error conditions in versioning
+    :return: whether the major component of the version should be incremented
+    """
     tick_major = False
     # Check for removed packages
     if old_packages.keys() - new_packages.keys():
         tick_major = True
     # Check for package downgrades
     for pkg in old_packages.keys() & new_packages.keys():
-        previous_version = pip_version.parse(old_packages[pkg])
-        new_version = pip_version.parse(new_packages[pkg])
+        previous_version = pkg_version.parse(old_packages[pkg])
+        new_version = pkg_version.parse(new_packages[pkg])
         if previous_version > new_version:
             tick_major = True
             _error(f"Package '{pkg}' has a lower version than previously built.")

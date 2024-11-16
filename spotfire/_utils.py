@@ -1,18 +1,21 @@
-# Copyright © 2021. TIBCO Software Inc.
+# Copyright © 2021. Cloud Software Group, Inc.
 # This file is subject to the license terms contained
 # in the license file that is distributed with this file.
 
 """Utilities used by multiple submodules."""
 import os
 import tempfile
+import typing
 
 
-def type_name(type_: type) -> str:
+def type_name(type_: typing.Optional[type]) -> str:
     """Convert a type object to a string in a consistent manner.
 
     :param type_: the type object to convert
     :return: a string with the type name
     """
+    if not type_:
+        return "None"
     type_qualname = type_.__qualname__
     type_module = type_.__module__
     if type_module not in ("__main__", "builtins"):
@@ -22,10 +25,12 @@ def type_name(type_: type) -> str:
 
 class TempFiles:
     """Utility class that manages the lifecycle of multiple temporary files."""
+    _files: list[typing.IO]
+
     def __init__(self) -> None:
         self._files = []
 
-    def new_file(self, **kwargs) -> tempfile.NamedTemporaryFile:
+    def new_file(self, **kwargs) -> typing.IO:
         """Create a temporary file object that will be tracked by this manager.
 
         :param kwargs: NamedTemporaryFile arguments

@@ -1,4 +1,4 @@
-# Copyright © 2021. TIBCO Software Inc.
+# Copyright © 2021. Cloud Software Group, Inc.
 # This file is subject to the license terms contained
 # in the license file that is distributed with this file.
 
@@ -9,10 +9,22 @@ import os.path
 import pprint
 import sys
 import traceback
+import types
 import typing
 import re
 
 from spotfire import sbdf, _utils
+
+
+_ExceptionInfo = typing.Union[
+    tuple[type[BaseException], BaseException, types.TracebackType],
+    tuple[None, None, None]
+]
+_Globals = dict[str, typing.Any]
+_LogFunction = typing.Callable[[str], None]
+
+
+_COLUMN_METADATA_TRUNCATE_THRESHOLD = 80000
 
 
 def _bad_string(str_: typing.Any) -> bool:
@@ -20,6 +32,9 @@ def _bad_string(str_: typing.Any) -> bool:
 
 
 class _OutputCapture:
+    _old_stdout: typing.Optional[typing.TextIO]
+    _old_stderr: typing.Optional[typing.TextIO]
+
     def __init__(self) -> None:
         self._entered = False
         self._stdout = io.StringIO()
@@ -41,8 +56,10 @@ class _OutputCapture:
         if not self._entered:
             raise ValueError("cannot exit unentered output capture")
         self._entered = False
-        sys.stdout = self._old_stdout
-        sys.stderr = self._old_stderr
+        if self._old_stdout:
+            sys.stdout = self._old_stdout
+        if self._old_stderr:
+            sys.stderr = self._old_stderr
         self._old_stdout = None
         self._old_stderr = None
 
@@ -51,14 +68,18 @@ class _OutputCapture:
 
         :return: string containing the output stream, or `None` if no output was captured
         """
-        return None if self._stdout.tell() == 0 else self._stdout.getvalue()
+        if self._stdout.tell():
+            return self._stdout.getvalue()
+        return None
 
     def get_stderr(self) -> typing.Optional[str]:
         """Return the captured standard error stream.
 
         :return: string containing the error stream, or `None` if no output was captured
         """
-        return None if self._stderr.tell() == 0 else self._stderr.getvalue()
+        if self._stderr.tell():
+            return self._stderr.getvalue()
+        return None
 
 
 class AnalyticInput:
@@ -71,45 +92,81 @@ class AnalyticInput:
         :param input_type: whether the input is a ``table``, a ``column``, or a ``value``
         :param file: the filename of the SBDF file that contains the data to read into this input
         """
-        self.name = name
-        self.type = input_type
-        self.file = file
+        self._name = name
+        self._type = input_type
+        self._file = file
 
     def __repr__(self) -> str:
-        return f"{_utils.type_name(type(self))}({self.name!r}, {self.type!r}, {self.file!r})"
+        return f"{_utils.type_name(type(self))}({self._name!r}, {self._type!r}, {self._file!r})"
 
-    def read(self, globals_dict: typing.Dict[str, typing.Any], debug_fn: typing.Callable[[str], None]) -> None:
+    @property
+    def name(self) -> str:
+        """Get the name of this input."""
+        return self._name
+
+    @property
+    def type(self) -> str:
+        """Get the type of this input.  Will be one of ``table``, ``column``, or ``value``."""
+        return self._type
+
+    @property
+    def file(self) -> str:
+        """Get the filename of the SBDF file to deserialize this input from."""
+        return self._file
+
+    def read(self, globals_dict: _Globals, debug_fn: _LogFunction) -> None:
         """Read an input from the corresponding SBDF file into the dict that comprises the set of globals.
 
         :param globals_dict: dict containing the global variables for the data function
         :param debug_fn: logging function for debug messages
         """
-        if self.type == "NULL":
-            debug_fn(f"assigning missing '{self.name}' as None")
-            globals_dict[self.name] = None
+        # pylint: disable=too-many-branches
+
+        if self._type == "NULL":
+            debug_fn(f"assigning missing '{self._name}' as None")
+            globals_dict[self._name] = None
             return
-        debug_fn(f"assigning {self.type} '{self.name}' from file {self.file}")
-        dataframe = sbdf.import_data(self.file)
+        debug_fn(f"assigning {self._type} '{self._name}' from file {self._file}")
+        dataframe = sbdf.import_data(self._file)
         debug_fn(f"read {dataframe.shape[0]} rows {dataframe.shape[1]} columns")
+
+        # Table metadata
         try:
-            table_meta = dataframe.spotfire_table_metadata
+            if dataframe.spotfire_table_metadata:
+                table_meta = f"\n {pprint.pformat(dataframe.spotfire_table_metadata)}"
+            else:
+                table_meta = " (no table metadata present)"
         except AttributeError:
-            table_meta = {}
-        column_meta = {}
+            table_meta = " (no table metadata present)"
+        debug_fn(f"table metadata:{table_meta}")
+
+        # Column metadata
+        column_blank = False
+        pretty_column = io.StringIO()
         for col in dataframe.columns:
             try:
-                column_meta[col] = dataframe[col].spotfire_column_metadata
+                if pretty_column.tell() > _COLUMN_METADATA_TRUNCATE_THRESHOLD:
+                    pretty_column.write("\n (truncated due to length)")
+                    break
+                if dataframe[col].spotfire_column_metadata:
+                    pretty_column.write(f"\n {col}: {pprint.pformat(dataframe[col].spotfire_column_metadata)}")
+                else:
+                    column_blank = True
             except AttributeError:
-                column_meta[col] = {}
-        pretty_table = io.StringIO()
-        pretty_column = io.StringIO()
-        pprint.pprint(table_meta, pretty_table)
-        pprint.pprint(column_meta, pretty_column)
-        debug_fn(f"table metadata: \n {pretty_table.getvalue()}")
-        debug_fn(f"column metadata: \n {pretty_column.getvalue()}")
-        if self.type == "column":
+                column_blank = True
+        if pretty_column.tell():
+            column_meta = pretty_column.getvalue()
+        else:
+            column_meta = " (no column metadata present)"
+            column_blank = False
+        if column_blank:
+            column_meta += "\n (columns without metadata have been omitted)"
+        debug_fn(f"column metadata:{column_meta}")
+
+        # Argument type
+        if self._type == "column":
             dataframe = dataframe[dataframe.columns[0]]
-        if self.type == "value":
+        if self._type == "value":
             value = dataframe.at[0, dataframe.columns[0]]
             if type(value).__module__ == "numpy":
                 dataframe = value.tolist()
@@ -121,7 +178,9 @@ class AnalyticInput:
                 dataframe = None
             else:
                 dataframe = value
-        globals_dict[self.name] = dataframe
+
+        # Store to global dict
+        globals_dict[self._name] = dataframe
 
 
 class AnalyticOutput:
@@ -133,38 +192,49 @@ class AnalyticOutput:
         :param name: the name of the output
         :param file: the filename of the SBDF file that will be created by writing from this output
         """
-        self.name = name
-        self.file = file
+        self._name = name
+        self._file = file
 
     def __repr__(self) -> str:
-        return f"{_utils.type_name(type(self))}({self.name!r}, {self.file!r})"
+        return f"{_utils.type_name(type(self))}({self._name!r}, {self._file!r})"
 
-    def write(self, globals_dict: typing.Dict[str, typing.Any], debug_fn: typing.Callable[[str], None]) -> None:
+    @property
+    def name(self) -> str:
+        """Get the name of this output."""
+        return self._name
+
+    @property
+    def file(self) -> str:
+        """Get the filename of the SBDF file to serialize this output to."""
+        return self._file
+
+    def write(self, globals_dict: _Globals, debug_fn: _LogFunction) -> None:
         """Write an output from the dict that comprises the set of globals file into the corresponding SBDF.
 
         :param globals_dict: dict containing the global variables from the data function
         :param debug_fn: logging function for debug messages
         """
-        debug_fn(f"returning '{self.name}' as file {self.file}")
-        sbdf.export_data(globals_dict[self.name], self.file, default_column_name=self.name)
+        debug_fn(f"returning '{self._name}' as file {self._file}")
+        sbdf.export_data(globals_dict[self._name], self._file, default_column_name=self._name)
 
 
 class AnalyticResult:
     """Represents the results of evaluating an AnalyticSpec object."""
+    std_err_out: typing.Optional[str]
+    summary: typing.Optional[str]
+    _exc_info: _ExceptionInfo
+    _debug_log: typing.Optional[str]
 
-    # pylint: disable=too-many-instance-attributes
-    # Eight is reasonable in this case.
-
-    def __init__(self) -> None:
+    def __init__(self, capture: _OutputCapture) -> None:
         self.success = True
         self.has_stderr = False
         self.std_err_out = None
         self.summary = None
-        self._exc_info = (type(None), None, None)
-        self._capture = None
+        self._exc_info = (None, None, None)
+        self._capture = capture
         self._debug_log = None
 
-    def fail_with_exception(self, exc_info) -> None:
+    def fail_with_exception(self, exc_info: _ExceptionInfo) -> None:
         """Set this result as failed with an exception."""
         self.fail()
         self._exc_info = exc_info
@@ -172,10 +242,6 @@ class AnalyticResult:
     def fail(self) -> None:
         """Set the result to Failed."""
         self.success = False
-
-    def set_capture(self, capture: _OutputCapture) -> None:
-        """Set the captured standard output and error of this result."""
-        self._capture = capture
 
     def get_capture(self) -> _OutputCapture:
         """Get the captured standard output and error of this result."""
@@ -185,21 +251,22 @@ class AnalyticResult:
         """Set the debug log that generated this result."""
         self._debug_log = log
 
-    def get_debug_log(self) -> str:
+    def get_debug_log(self) -> typing.Optional[str]:
         """Get the debug log for this result."""
         return self._debug_log
 
-    def get_exc_info(self):
+    def get_exc_info(self) -> _ExceptionInfo:
         """Get the exception information."""
         return self._exc_info
 
 
 class AnalyticSpec:
     """Represents an analytic spec used to process a data function."""
-
     # pylint: disable=too-many-instance-attributes
+    globals: _Globals
+    compiled_script: typing.Optional[types.CodeType]
 
-    def __init__(self, analytic_type: str, inputs: typing.List[AnalyticInput], outputs: typing.List[AnalyticOutput],
+    def __init__(self, analytic_type: str, inputs: list[AnalyticInput], outputs: list[AnalyticOutput],
                  script: str) -> None:
         """Create an analytic spec.
 
@@ -213,7 +280,12 @@ class AnalyticSpec:
         self.outputs = outputs if isinstance(outputs, list) else []
         self.script = script
         self.debug_enabled = False
-        self.globals = dict(__builtins__=__builtins__)
+        self.script_filename = '<data_function>'
+        self.globals = {
+            '__builtins__': __builtins__,
+            '__spotfire_inputs__': tuple(inputs),
+            '__spotfire_outputs__': tuple(outputs),
+        }
         self.log = io.StringIO()
         self.compiled_script = None
 
@@ -224,6 +296,13 @@ class AnalyticSpec:
     def enable_debug(self) -> None:
         """Turn on the printing of debugging messages."""
         self.debug_enabled = True
+
+    def set_script_filename(self, filename: str) -> None:
+        """Set the filename of the script when this spec object is used for script debugging.
+
+        :param filename: the filename of the script
+        """
+        self.script_filename = filename
 
     def debug(self, message: str) -> None:
         """Output a debugging message to the log if debug is enabled.
@@ -240,19 +319,18 @@ class AnalyticSpec:
             self.log.write("\n")
 
     def evaluate(self) -> AnalyticResult:
-        """Run the script in the in the analytic spec and process the results.
+        """Run the script in the analytic spec and process the results.
 
         :return: whether the data function was evaluated successfully, the text output of the data function or an error
         message describing why the data function failed, and the exception information and stack trace if the data
         function raised any errors
         """
         self.debug("start evaluate")
-        result = AnalyticResult()
 
         # noinspection PyBroadException
         try:
             with _OutputCapture() as capture:
-                result.set_capture(capture)
+                result = AnalyticResult(capture)
 
                 # parse and compile the script first
                 self._compile_script(result)
@@ -265,7 +343,8 @@ class AnalyticSpec:
                     return self._summarize(result)
 
                 # execute the script
-                self._execute_script(self.compiled_script, result)
+                if self.compiled_script:
+                    self._execute_script(self.compiled_script, result)
                 if not result.success:
                     return self._summarize(result)
 
@@ -291,23 +370,22 @@ class AnalyticSpec:
         """"Parse and compile the script"""
         # noinspection PyBroadException
         try:
-            self.compiled_script = compile(self.script, '<data_function>', 'exec')
+            self.compiled_script = compile(self.script, self.script_filename, 'exec')
         except BaseException:
             self.debug("script can't be parsed:")
             self.debug("--- script ---")
             self.debug_write_script()
             self.debug("--- script ---")
             result.fail_with_exception(sys.exc_info())
-            return
 
     def _read_inputs(self, result: AnalyticResult) -> None:
         """read inputs"""
         self.debug(f"reading {len(self.inputs)} input variables")
         for i, input_ in enumerate(self.inputs):
-            if _bad_string(input_.name) or input_.name == "":
+            if _bad_string(input_.name) or not input_.name:
                 self.debug(f"input {i}: bad input variable name - skipped")
                 continue
-            if input_.type != "NULL" and (_bad_string(input_.file) or input_.file == ""):
+            if input_.type != "NULL" and (_bad_string(input_.file) or not input_.file):
                 self.debug(f"input '{input_.name}': bad file name - skipped")
                 continue
             if input_.type != "NULL" and not os.path.isfile(input_.file):
@@ -322,7 +400,7 @@ class AnalyticSpec:
         self.debug(f"done reading {len(self.inputs)} input variables")
         return
 
-    def _execute_script(self, compiled_script: typing.Any, result: AnalyticResult) -> None:
+    def _execute_script(self, compiled_script: types.CodeType, result: AnalyticResult) -> None:
         """execute the script"""
         # pylint: disable=exec-used
         self.debug("executing script")
@@ -349,10 +427,10 @@ class AnalyticSpec:
         """write outputs"""
         self.debug(f"writing {len(self.outputs)} output variables")
         for i, output in enumerate(self.outputs):
-            if _bad_string(output.name) or output.name == "":
+            if _bad_string(output.name) or not output.name:
                 self.debug(f"output {i}: bad output variable name - skipped")
                 continue
-            if _bad_string(output.file) or output.file == "":
+            if _bad_string(output.file) or not output.file:
                 self.debug(f"output '{output.name}': bad file name - skipped")
                 continue
             if output.name not in self.globals:
@@ -379,16 +457,14 @@ class AnalyticSpec:
         try:
             if not result.success:
                 buf.write("Error executing Python script:\n\n")
-                if result.get_exc_info()[2] is not None:
+                exc_info = result.get_exc_info()
+                if exc_info[0] and exc_info[1] and exc_info[2]:
                     # noinspection PyBroadException
                     try:
                         # If it was a syntax error, show the text with the caret
-                        exc_type = _utils.type_name(result.get_exc_info()[0])
-                        # pylint: disable=consider-using-in
-                        if exc_type == "SyntaxError" or exc_type == "IndentationError" or exc_type == "TabError":
-                            syntax_error = traceback.TracebackException(result.get_exc_info()[0],
-                                                                        result.get_exc_info()[1],
-                                                                        result.get_exc_info()[2])
+                        exc_type = _utils.type_name(exc_info[0])
+                        if exc_type in ("SyntaxError", "IndentationError", "TabError"):
+                            syntax_error = traceback.TracebackException(exc_info[0], exc_info[1], exc_info[2])
                             buf.write(f'  File "{syntax_error.filename}", line {syntax_error.lineno}\n')
                             buf.write(f"    {syntax_error.text}")
                             # sometimes the offset is wrong, placing the caret before or after the text.
@@ -399,39 +475,55 @@ class AnalyticSpec:
                                 spacer -= 1
                             offset = " " * spacer
                             buf.write(f"    {offset}^\n")
-                        buf.write(f"{exc_type}: {result.get_exc_info()[1]}\n\n")
-                        buf.write("Traceback (most recent call last):\n")
-                        # get the StackSummary
-                        tb_frames = traceback.extract_tb(result.get_exc_info()[2])
-                        # get the FrameSummary objects from the StackSummary
-                        lines = traceback.format_list(tb_frames)
-
-                        # trim the path from the filename
-                        def shorten(match):
-                            """trim the path from the exception filename"""
-                            return f'File "{os.path.basename(match.group(1))}"'
-
-                        lines = [re.sub(r'File "([^"]+)"', shorten, line, 1) for line in lines]
-                        buf.writelines(lines)
+                        buf.write(f"{exc_type}: {exc_info[1]}\n\n")
+                        self._create_traceback(buf, exc_info[1])
                     except BaseException:
-                        buf.write(f"\nCould not retrieve stacktrace: {traceback.print_exc()}")
+                        buf.write(f"\nCould not retrieve stacktrace: {traceback.format_exc()}")
             if result.get_capture() is not None:
                 out = result.get_capture().get_stdout()
-                if out is not None:
+                if out:
                     buf.write("\nStandard output:\n")
                     buf.write(out)
                 result.std_err_out = result.get_capture().get_stderr()
-                if result.std_err_out is not None:
+                if result.std_err_out:
                     result.has_stderr = True
                     buf.write("\nStandard error:\n")
                     buf.write(result.std_err_out)
             if self.debug_enabled:
-                if result.get_debug_log() is not None:
+                debug_log = result.get_debug_log()
+                if debug_log:
                     buf.write("\nDebug log:\n")
-                    buf.write(result.get_debug_log())
+                    buf.write(debug_log)
         except SystemError as err:
             buf.write(str(err))
         result.summary = buf.getvalue()
+
+    def _create_traceback(self, buf, exc_val):
+        """Format a traceback as a string that can be displayed to the user."""
+        # print the header
+        buf.write("Traceback (most recent call last):\n")
+
+        # get the StackSummary
+        tb_frames = traceback.extract_tb(exc_val.__traceback__)
+        # get the FrameSummary objects from the StackSummary
+        lines = traceback.format_list(tb_frames)
+
+        # trim the path from the filename
+        def shorten(match):
+            """trim the path from the exception filename"""
+            return f'File "{os.path.basename(match.group(1))}"'
+
+        lines = [re.sub(r'File "([^"]+)"', shorten, line, 1) for line in lines]
+
+        # print the lines
+        buf.writelines(lines)
+
+        # recurse if we have a cause
+        if exc_val.__cause__:
+            buf.write("\nThe following exception was the direct cause of the above exception:\n\n")
+            exc_cause_type = _utils.type_name(type(exc_val.__cause__))
+            self._create_traceback(buf, exc_val.__cause__)
+            buf.write(f"{exc_cause_type}: {exc_val.__cause__}\n")
 
 
 # Exceptions
